@@ -39,13 +39,11 @@ Feladatod: Fordítsd le ezt a közösségi média bejegyzést angolról magyarra
 
 FORDÍTÁSI ELVEK:
 - Használj természetes, gördülékeny magyar nyelvezetet - ne szó szerinti fordítást!
-- Tartsd meg az eredeti hangnemet és stílust (ha harcos, az maradjon harcos; ha informális, az informális)
-- Politikai/publicisztikai szövegekhez használj kifejező, erőteljes magyar nyelvezetet
+- Tartsd meg az eredeti hangnemet és stílust
+- Ha a bemenet elején "[ReTruthed from @XYZ]" jelzés van, akkor a fordítást KEZDD ÍGY: "Donald Trump megosztotta @XYZ bejegyzését:" és folytasd a tartalommal (vagy "aki arról írt, hogy...").
+- Külső linkek (X.com, cikkek): Ha csak linket látsz, írd le: "Megosztott egy Linket/X bejegyzést."
 - NE fordítsd le: URL-eket, hashtag-eket (#), említéseket (@)
-- Ha van idiomatikus angol kifejezés, használj neki megfelelő magyar megfelelőt
-- Kerüld a magyartalanságokat és az angolból átvett mondatszerkezeteket
-
-VÁLASZ: Csak a lefordított szöveget add vissza, semmi mást!"""
+- VÁLASZ: Csak a lefordított, narratív szöveget add vissza."""
 
 
 class HybridScraper:
@@ -356,7 +354,9 @@ class DiscordPoster:
                 original_text = original_text[:1800] + "... [tovább az eredeti linken]"
             
             # Formatting for ReTruths
-            if post_data.get("is_retruth"):
+            # If we have a translation, the Narrative Prompt handles the introduction ("Trump shared...").
+            # We only add the explicit header if we are falling back to original English text.
+            if post_data.get("is_retruth") and not translated_text:
                  description_parts.append(f"**{retruth_header}**")
                  description_parts.append("---")
 
@@ -580,12 +580,35 @@ def main():
                     # We have the URL, now let's get the details
                     details = scraper.scrape_details(post['url'])
                     
-                    # Merge details into post object
-                    post.update(details)
+                    # Merge Logic (Smart Fallback):
+                    # 1. Capture what we want to keep from details
+                    deep_media = details.get('media_urls', [])
+                    video_url = details.get('video_url')
+                    full_text = details.get('full_text')
+                    is_retruth = details.get('is_retruth')
+                    retruth_header = details.get('retruth_header')
+
+                    # 2. Update Post Text & Metadata
+                    post['is_retruth'] = is_retruth
+                    if is_retruth:
+                         post['retruth_header'] = retruth_header
                     
-                    # Use better text if available
-                    if details.get('full_text') and len(details['full_text']) > len(post.get('content', '')):
-                        post['content'] = details['full_text']
+                    if video_url:
+                         post['video_url'] = video_url
+                    
+                    if full_text and len(full_text) > len(post.get('content', '')):
+                         post['content'] = full_text
+
+                    # 3. Image Priority
+                    # If Deep Scrape found images, use them (High Res).
+                    # If NOT, keep the Roll Call images (Stage 1), because they might be snapshots of X/Links.
+                    if deep_media:
+                        post['media_urls'] = deep_media
+                        log(f"  -> Using Deep Scrape media ({len(deep_media)} images)")
+                    else:
+                        log(f"  -> Deep Scrape found no media. Keeping Roll Call fallback ({len(post.get('media_urls', []))} images)")
+
+                    # NOTE: We do NOT call post.update(details) blindy anymore, to protect media_urls
 
                     # Prepare text for translation
                     original_text = translator.clean_text(post.get('content', ""))
