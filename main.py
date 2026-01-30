@@ -462,6 +462,7 @@ class DiscordPoster:
             # Retry loop for Rate Limits (429)
             import time
             for attempt in range(3):
+                log(f"-> Sending Discord request (User: {self.webhook_url[:20]}...) [Attempt {attempt+1}] at {time.time()}")
                 response = webhook.execute()
 
                 if response.status_code == 429:
