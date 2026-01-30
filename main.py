@@ -199,22 +199,22 @@ class HybridScraper:
                 )
                 page = context.new_page()
 
-                    for i in range(2): # Try twice
-                        try:
-                            # Navigate to Truth Social
-                            # Note: Without cookies, we rely on the page being public.
-                            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                            
-                            # Wait for main content
-                            page.wait_for_selector("div.status__content", timeout=30000)
-                            log("✓ [Stage 2] Truth Social page loaded")
-                            break # Success
-                        except Exception as e:
-                            log(f"⚠ [Stage 2] Retry {i+1}/2: Page load/selector timeout: {e}")
-                            if i == 1: raise e # Propagate on last try
+                for i in range(2): # Try twice
+                    try:
+                        # Navigate to Truth Social
+                        # Note: Without cookies, we rely on the page being public.
+                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
                         
-                        # Extract Data
-                        evaluated = page.evaluate("""() => {
+                        # Wait for main content
+                        page.wait_for_selector("div.status__content", timeout=30000)
+                        log("✓ [Stage 2] Truth Social page loaded")
+                        break # Success
+                    except Exception as e:
+                        log(f"⚠ [Stage 2] Retry {i+1}/2: Page load/selector timeout: {e}")
+                        if i == 1: raise e # Propagate on last try
+                    
+                # Extract Data
+                evaluated = page.evaluate("""() => {
                             const res = {
                                 is_retruth: false,
                                 retruth_header: "",
