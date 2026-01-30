@@ -199,19 +199,16 @@ class HybridScraper:
                 )
                 page = context.new_page()
 
-                for i in range(2): # Try twice
-                    try:
-                        # Navigate to Truth Social
-                        # Note: Without cookies, we rely on the page being public.
-                        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                        
-                        # Wait for main content
-                        page.wait_for_selector("div.status__content", timeout=30000)
-                        log("✓ [Stage 2] Truth Social page loaded")
-                        break # Success
-                    except Exception as e:
-                        log(f"⚠ [Stage 2] Retry {i+1}/2: Page load/selector timeout: {e}")
-                        if i == 1: raise e # Propagate on last try
+                try:
+                    # Navigate to Truth Social
+                    # Note: Without cookies, we rely on the page being public.
+                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    
+                    # Wait for main content
+                    page.wait_for_selector("div.status__content", timeout=15000)
+                    log("✓ [Stage 2] Truth Social page loaded")
+                except Exception as e:
+                     log(f"⚠ [Stage 2] Navigation/Timeout (skipping deep scrape): {e}")
                     
                 
                 # Try to extract data if navigation succeeded
@@ -461,12 +458,30 @@ class DiscordPoster:
             embed.set_color(color=0x1DA1F2)
 
             webhook.add_embed(embed)
-            response = webhook.execute()
+            
+            # Retry loop for Rate Limits (429)
+            import time
+            for attempt in range(3):
+                response = webhook.execute()
 
-            if response.status_code in [200, 204]:
-                log("✓ Posted to Discord successfully")
-            else:
-                log(f"✗ Discord post failed with status {response.status_code}")
+                if response.status_code == 429:
+                    # Rate Limit Hit
+                    try:
+                        # Try to get retry-after from headers, default to 5s
+                        retry_after = float(response.headers.get('Retry-After', 5))
+                    except:
+                        retry_after = 5
+                    
+                    log(f"⚠ Discord Rate Limit (429). Waiting {retry_after}s before retry {attempt+1}/3...")
+                    time.sleep(retry_after + 1) # Add 1s buffer
+                    continue # Retry
+                
+                elif response.status_code in [200, 204]:
+                    log("✓ Posted to Discord successfully")
+                    break # Success
+                else:
+                    log(f"✗ Discord post failed with status {response.status_code}")
+                    break # Don't retry other errors blindly
 
         except Exception as e:
             log(f"✗ Error posting to Discord: {e}")
