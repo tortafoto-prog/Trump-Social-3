@@ -199,15 +199,19 @@ class HybridScraper:
                 )
                 page = context.new_page()
 
-                try:
-                    # Navigate to Truth Social
-                    # Note: Without cookies, we rely on the page being public.
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    
-                    # Wait for main content
-                    try:
-                        page.wait_for_selector("div.status__content", timeout=15000)
-                        log("✓ [Stage 2] Truth Social page loaded")
+                    for i in range(2): # Try twice
+                        try:
+                            # Navigate to Truth Social
+                            # Note: Without cookies, we rely on the page being public.
+                            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                            
+                            # Wait for main content
+                            page.wait_for_selector("div.status__content", timeout=30000)
+                            log("✓ [Stage 2] Truth Social page loaded")
+                            break # Success
+                        except Exception as e:
+                            log(f"⚠ [Stage 2] Retry {i+1}/2: Page load/selector timeout: {e}")
+                            if i == 1: raise e # Propagate on last try
                         
                         # Extract Data
                         evaluated = page.evaluate("""() => {
@@ -668,6 +672,9 @@ def main():
                         translated = translator.translate_to_hungarian(full_input)
 
                     discord_poster.post_to_discord(post, translated, original_text)
+                    
+                    # Sleep to prevent Discord Rate Limits (429) and allow browser cleanup
+                    time.sleep(5)
                     
                     # Update state immediately
                     check_last_id = post['id']
