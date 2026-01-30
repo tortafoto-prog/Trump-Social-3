@@ -213,62 +213,66 @@ class HybridScraper:
                         log(f"⚠ [Stage 2] Retry {i+1}/2: Page load/selector timeout: {e}")
                         if i == 1: raise e # Propagate on last try
                     
-                # Extract Data
-                evaluated = page.evaluate("""() => {
-                            const res = {
-                                is_retruth: false,
-                                retruth_header: "",
-                                full_text: "",
-                                media_urls: [],
-                                video_url: null
-                            };
-                            
-                            // 1. Check ReTruth Header ("ReTruthed by...")
-                            const headerEl = document.querySelector('.status__header');
-                            if (headerEl && headerEl.innerText.includes('ReTruthed')) {
-                                res.is_retruth = true;
-                                res.retruth_header = headerEl.innerText.trim();
-                            }
-
-                            // 2. Get Full Text
-                            const contentEl = document.querySelector('.status__content');
-                            if (contentEl) {
-                                res.full_text = contentEl.innerText.trim();
-                            }
-
-                            // 3. Link Previews / Cards (CRITICAL for X posts and Articles)
-                            // Truth Social wrappers external links in a .status-card info block
-                            const cardEl = document.querySelector('a.status-card');
-                            if (cardEl) {
-                                const title = cardEl.querySelector('strong.status-card__title')?.innerText.trim();
-                                const desc = cardEl.querySelector('.status-card__description')?.innerText.trim();
-                                if (title || desc) {
-                                    res.card_content = [title, desc].filter(Boolean).join("\\n");
-                                }
-                            }
-
-                            // 4. Media Extraction (High Res)
-                            // Images
-                            const mediaDiv = document.querySelector('.status__media');
-                            if (mediaDiv) {
-                                const imgs = Array.from(mediaDiv.querySelectorAll('img'));
-                                res.media_urls = imgs.map(img => img.src);
-                                
-                                // Videos (status__video usually contains video or iframe)
-                                const videoEl = mediaDiv.querySelector('video');
-                                if (videoEl) {
-                                    res.video_url = videoEl.src;
-                                }
-                            }
-                            
-                            return res;
-                        }""")
+                
+                # Try to extract data if navigation succeeded
+                try:
+                    # Extract Data
+                    evaluated = page.evaluate("""() => {
+                        const res = {
+                            is_retruth: false,
+                            retruth_header: "",
+                            full_text: "",
+                            media_urls: [],
+                            video_url: null,
+                            card_content: ""
+                        };
                         
-                        details.update(evaluated)
-                        log(f"  -> Extracted: ReTruth={details['is_retruth']}, Card={bool(details.get('card_content'))}, Media={len(details['media_urls'])}")
+                        // 1. Check ReTruth Header ("ReTruthed by...")
+                        const headerEl = document.querySelector('.status__header');
+                        if (headerEl && headerEl.innerText.includes('ReTruthed')) {
+                            res.is_retruth = true;
+                            res.retruth_header = headerEl.innerText.trim();
+                        }
 
-                    except Exception as e:
-                        log(f"⚠ [Stage 2] Could not find post content (possibly blocked or layout changed): {e}")
+                        // 2. Get Full Text
+                        const contentEl = document.querySelector('.status__content');
+                        if (contentEl) {
+                            res.full_text = contentEl.innerText.trim();
+                        }
+
+                        // 3. Link Previews / Cards (CRITICAL for X posts and Articles)
+                        // Truth Social wrappers external links in a .status-card info block
+                        const cardEl = document.querySelector('a.status-card');
+                        if (cardEl) {
+                            const title = cardEl.querySelector('strong.status-card__title')?.innerText.trim();
+                            const desc = cardEl.querySelector('.status-card__description')?.innerText.trim();
+                            if (title || desc) {
+                                res.card_content = [title, desc].filter(Boolean).join("\\n");
+                            }
+                        }
+
+                        // 4. Media Extraction (High Res)
+                        // Images
+                        const mediaDiv = document.querySelector('.status__media');
+                        if (mediaDiv) {
+                            const imgs = Array.from(mediaDiv.querySelectorAll('img'));
+                            res.media_urls = imgs.map(img => img.src);
+                            
+                            // Videos (status__video usually contains video or iframe)
+                            const videoEl = mediaDiv.querySelector('video');
+                            if (videoEl) {
+                                res.video_url = videoEl.src;
+                            }
+                        }
+                        
+                        return res;
+                    }""")
+                    
+                    details.update(evaluated)
+                    log(f"  -> Extracted: ReTruth={details['is_retruth']}, Card={bool(details.get('card_content'))}, Media={len(details['media_urls'])}")
+
+                except Exception as e:
+                    log(f"⚠ [Stage 2] Could not find post content (possibly blocked or layout changed): {e}")
 
                 except Exception as e:
                     log(f"✗ [Stage 2] Navigation error: {e}")
