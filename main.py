@@ -38,12 +38,14 @@ TRANSLATION_SYSTEM_PROMPT = """Te egy professzionális fordító vagy, aki gyön
 Feladatod: Fordítsd le ezt a közösségi média bejegyzést angolról magyarra!
 
 FORDÍTÁSI ELVEK:
-- Használj természetes, gördülékeny magyar nyelvezetet - ne szó szerinti fordítást!
-- Tartsd meg az eredeti hangnemet és stílust
-- Ha a bemenet elején "[ReTruthed from @XYZ]" jelzés van, akkor a fordítást KEZDD ÍGY: "Donald Trump megosztotta @XYZ bejegyzését:" és folytasd a tartalommal (vagy "aki arról írt, hogy...").
-- Külső linkek (X.com, cikkek): Ha csak linket látsz, írd le: "Megosztott egy Linket/X bejegyzést."
+- Használj természetes, gördülékeny magyar nyelvezetet.
+- Tartsd meg az eredeti hangnemet.
+- **Speciális Bemeneti Címkék Kezelése:**
+    - "[ReTruthed from @XYZ]": Kezdd így: "Donald Trump megosztotta @XYZ bejegyzését:"
+    - "[SHARED_CONTENT]": Ez a megosztott bejegyzés szövege. Fordítsd le és illeszd be a fenti bevezető után.
+    - "[LINK_PREVIEW]": Ez egy külső link/cikk/X-poszt tartalma. Kezdd így: "Donald Trump megosztott egy X/TRUTH bejegyzést, ami a következőt tartalmazza:", majd fordítsd le a tartalmat.
 - NE fordítsd le: URL-eket, hashtag-eket (#), említéseket (@)
-- VÁLASZ: Csak a lefordított, narratív szöveget add vissza."""
+- VÁLASZ: Csak a kész, formázott magyar szöveget add vissza."""
 
 
 class HybridScraper:
@@ -152,8 +154,11 @@ class HybridScraper:
                 except Exception as e:
                     log(f"✗ Error during scraping: {e}")
                 finally:
-                    browser.close()
-                    log("✓ Browser closed")
+                    try:
+                        browser.close()
+                        log("✓ Browser closed")
+                    except Exception as e:
+                        log(f"⚠ Warning: Could not close browser cleanly: {e}")
 
         except Exception as e:
             log(f"✗ Playwright/Timeout error: {e}")
@@ -221,13 +226,24 @@ class HybridScraper:
                                 res.retruth_header = headerEl.innerText.trim();
                             }
 
-                            // 2. Get Full Text (handling "Show more" if needed, though usually expanded on permalink)
+                            // 2. Get Full Text
                             const contentEl = document.querySelector('.status__content');
                             if (contentEl) {
                                 res.full_text = contentEl.innerText.trim();
                             }
 
-                            // 3. Media Extraction (High Res)
+                            // 3. Link Previews / Cards (CRITICAL for X posts and Articles)
+                            // Truth Social wrappers external links in a .status-card info block
+                            const cardEl = document.querySelector('a.status-card');
+                            if (cardEl) {
+                                const title = cardEl.querySelector('strong.status-card__title')?.innerText.trim();
+                                const desc = cardEl.querySelector('.status-card__description')?.innerText.trim();
+                                if (title || desc) {
+                                    res.card_content = [title, desc].filter(Boolean).join("\\n");
+                                }
+                            }
+
+                            // 4. Media Extraction (High Res)
                             // Images
                             const mediaDiv = document.querySelector('.status__media');
                             if (mediaDiv) {
@@ -245,7 +261,7 @@ class HybridScraper:
                         }""")
                         
                         details.update(evaluated)
-                        log(f"  -> Extracted: ReTruth={details['is_retruth']}, Media={len(details['media_urls'])}")
+                        log(f"  -> Extracted: ReTruth={details['is_retruth']}, Card={bool(details.get('card_content'))}, Media={len(details['media_urls'])}")
 
                     except Exception as e:
                         log(f"⚠ [Stage 2] Could not find post content (possibly blocked or layout changed): {e}")
@@ -259,6 +275,13 @@ class HybridScraper:
         # Cancel alarm
         if hasattr(signal, "alarm"):
             signal.alarm(0)
+
+        # Ensure browser is closed
+        if 'browser' in locals():
+            try:
+                browser.close()
+            except Exception as e:
+                log(f"⚠ [Stage 2] Warning: Could not close browser cleanly: {e}")
 
         return details
 
@@ -612,19 +635,37 @@ def main():
 
                     # Prepare text for translation
                     original_text = translator.clean_text(post.get('content', ""))
+                    card_content = details.get('card_content', "")
                     translated = ""
                     
-                    if original_text:
-                        # Add context for Translator if it's a ReTruth
-                        translation_input = original_text
-                        if post.get('is_retruth'):
-                            # Prepend context so the AI knows it's a share
-                            # "ReTruthed from @user" header is available in post['retruth_header']
-                            # We construct a prompt-friendly format
-                            header = post.get('retruth_header', 'ReTruth')
-                            translation_input = f"[{header}]\n{original_text}"
+                    # Construct Composite Prompt Logic
+                    translation_parts = []
+                    
+                    # 1. Trump's own text (or the ReTruth header context)
+                    if post.get('is_retruth'):
+                         header = post.get('retruth_header', 'ReTruthed from ???')
+                         translation_parts.append(f"[{header}]")
+                         
+                         # If it's a simple ReTruth (Trump wrote nothing), original_text is likely the shared content
+                         # We mark it as [SHARED_CONTENT] so the AI knows to say "Trump shared a post containing..."
+                         if original_text:
+                             translation_parts.append("[SHARED_CONTENT]")
+                             translation_parts.append(original_text)
+                    else:
+                        # Normal post by Trump
+                        if original_text:
+                            translation_parts.append(original_text)
 
-                        translated = translator.translate_to_hungarian(translation_input)
+                    # 2. Variable: Link Previews (X posts, Articles)
+                    # If we found card content (Title/Desc from X or Article), add it as context
+                    if card_content:
+                        translation_parts.append("\n[LINK_PREVIEW]")
+                        translation_parts.append(card_content)
+
+                    # 3. Execute Translation if we have ANY content
+                    if translation_parts:
+                        full_input = "\n".join(translation_parts)
+                        translated = translator.translate_to_hungarian(full_input)
 
                     discord_poster.post_to_discord(post, translated, original_text)
                     
