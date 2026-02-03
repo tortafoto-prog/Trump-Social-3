@@ -24,7 +24,7 @@ def log(message: str):
 # Configuration from environment variables
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-7-sonnet-20250219")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 FORCE_REPROCESS = os.getenv("FORCE_REPROCESS", "false").lower() == "true"
@@ -65,30 +65,29 @@ class HybridScraper:
             def handler(signum, frame):
                 raise TimeoutError("Scraping timed out (Hard Limit)")
             signal.signal(signal.SIGALRM, handler)
-            signal.alarm(180) # 3 minutes hard limit (generous for start)
+            signal.alarm(180) # 3 minutes hard limit
 
         try:
+            # Ephemeral Playwright: Launch new instance every check to avoid zombies
             with sync_playwright() as p:
                 log("⏳ Opening headless browser to scrape Roll Call...")
                 browser = p.chromium.launch(
                     headless=self.headless,
                     args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
                 )
-                log("✓ Browser launched successfully")
-
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
-                page = context.new_page()
-                log("✓ Page created, navigating to Roll Call...")
-
+                
                 try:
+                    context = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                    page = context.new_page()
+                    log("✓ Page created, navigating to Roll Call...")
+
                     # Add cache buster to URL
                     cache_buster = int(time.time())
                     final_url = f"{ROLLCALL_URL}&t={cache_buster}"
                     
-                    # Use domcontentloaded instead of networkidle (faster, more reliable)
-                    page.goto(final_url, wait_until="domcontentloaded", timeout=90000)
+                    page.goto(final_url, wait_until="domcontentloaded", timeout=60000)
                     log("✓ DOM loaded, waiting for posts to render...")
 
                     # Wait for the actual post content to appear
@@ -98,14 +97,14 @@ class HybridScraper:
                     # Wait a bit more for Alpine.js to render content
                     time.sleep(5)
                     
-                    log("⏳ Extracting data from page...")
+                    # Run extraction code in browser
                     extracted_data = page.evaluate("""() => {
                         const posts = [];
                         const cards = document.querySelectorAll('div.rounded-xl.border');
 
                         cards.forEach(card => {
                             // Only process cards that have a Truth Social link
-                            const truthLinkEl = Array.from(card.querySelectorAll('a')).find(a =>
+                            const truthLinkEl = Array.from(card.querySelectorAll('a')).find(a => 
                                 a.innerText.includes('View on Truth Social') && a.href.includes('truthsocial.com')
                             );
 
@@ -115,21 +114,19 @@ class HybridScraper:
                             const contentEl = card.querySelector('div.text-sm.font-medium.whitespace-pre-wrap');
                             const content = contentEl ? contentEl.innerText.trim() : "";
 
-                            const timeEl = Array.from(card.querySelectorAll('div')).find(div =>
+                            const timeEl = Array.from(card.querySelectorAll('div')).find(div => 
                                 div.innerText.includes('@') && div.innerText.includes('ET')
                             );
                             const timestamp_str = timeEl ? timeEl.innerText.trim() : "";
-
+                            
                             // Extract ID from URL
-                            const matches = url.match(/posts\\/(\\d+)/);
+                            const matches = url.match(/posts\/(\d+)/);
                             const id = matches ? matches[1] : "";
 
                             // Extract Media (Images for ReTruths/Posts)
                             const imgs = Array.from(card.querySelectorAll('img'));
                             const mediaUrls = imgs
                                 .filter(img => {
-                                    // Filter out usually small avatars or icons.
-                                    // Assuming content images are larger.
                                     return img.naturalWidth > 150 || img.naturalHeight > 150;
                                 })
                                 .map(img => img.src);
@@ -141,18 +138,19 @@ class HybridScraper:
                                     content: content,
                                     timestamp_str: timestamp_str,
                                     media_urls: mediaUrls,
-                                    created_at: new Date().toISOString()
+                                    source: "rollcall"
                                 });
                             }
                         });
+                        
+                        // Sort by ID (numerical) just in case
+                        posts.sort((a, b) => BigInt(a.id) - BigInt(b.id));
                         return posts;
                     }""")
 
                     posts = extracted_data
                     log(f"✓ Found {len(posts)} posts on Roll Call")
 
-                except Exception as e:
-                    log(f"✗ Error during scraping: {e}")
                 finally:
                     try:
                         browser.close()
@@ -173,19 +171,21 @@ class HybridScraper:
         """Stage 2: Deep Scrape from Truth Social Direct Link (Public Access)"""
         details = {
             "is_retruth": False,
-            "retruth_header": "", # "ReTruthed from @target"
+            "retruth_header": "",
             "full_text": "",
             "media_urls": [],
             "video_url": None,
-            "external_link": None
+            "card_content": ""
         }
         
         # Set a shorter timeout for Stage 2
         import signal
         if hasattr(signal, "alarm"):
-            signal.alarm(90) # 90s for single detail scrape
+            # Increased slightly to give browser launch time, but still fail fast on load
+            signal.alarm(45)
 
         try:
+            # Ephemeral Playwright again for robustness
             with sync_playwright() as p:
                 log(f"⏳ [Stage 2] Deep scraping: {url}")
                 browser = p.chromium.launch(
@@ -193,100 +193,91 @@ class HybridScraper:
                     args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
                 )
                 
-                # Standard User Agent to look like a real browser
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
-                page = context.new_page()
+                try:
+                    context = browser.new_context(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                    page = context.new_page()
 
-                try:
-                    # Navigate to Truth Social
-                    # Note: Without cookies, we rely on the page being public.
-                    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    
-                    # Wait for main content
-                    page.wait_for_selector("div.status__content", timeout=15000)
-                    log("✓ [Stage 2] Truth Social page loaded")
-                except Exception as e:
-                     log(f"⚠ [Stage 2] Navigation/Timeout (skipping deep scrape): {e}")
-                    
-                
-                # Try to extract data if navigation succeeded
-                try:
-                    # Extract Data
-                    evaluated = page.evaluate("""() => {
-                        const res = {
-                            is_retruth: false,
-                            retruth_header: "",
-                            full_text: "",
-                            media_urls: [],
-                            video_url: null,
-                            card_content: ""
-                        };
+                    try:
+                        # Navigate to Truth Social
+                        # Note: Without cookies, we rely on the page being public.
+                        # Fail fast if blocked (15s)
+                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
                         
-                        // 1. Check ReTruth Header ("ReTruthed by...")
-                        const headerEl = document.querySelector('.status__header');
-                        if (headerEl && headerEl.innerText.includes('ReTruthed')) {
-                            res.is_retruth = true;
-                            res.retruth_header = headerEl.innerText.trim();
-                        }
-
-                        // 2. Get Full Text
-                        const contentEl = document.querySelector('.status__content');
-                        if (contentEl) {
-                            res.full_text = contentEl.innerText.trim();
-                        }
-
-                        // 3. Link Previews / Cards (CRITICAL for X posts and Articles)
-                        // Truth Social wrappers external links in a .status-card info block
-                        const cardEl = document.querySelector('a.status-card');
-                        if (cardEl) {
-                            const title = cardEl.querySelector('strong.status-card__title')?.innerText.trim();
-                            const desc = cardEl.querySelector('.status-card__description')?.innerText.trim();
-                            if (title || desc) {
-                                res.card_content = [title, desc].filter(Boolean).join("\\n");
-                            }
-                        }
-
-                        // 4. Media Extraction (High Res)
-                        // Images
-                        const mediaDiv = document.querySelector('.status__media');
-                        if (mediaDiv) {
-                            const imgs = Array.from(mediaDiv.querySelectorAll('img'));
-                            res.media_urls = imgs.map(img => img.src);
+                        # Wait for main content
+                        page.wait_for_selector("div.status__content", timeout=15000)
+                        log("✓ [Stage 2] Truth Social page loaded")
+                        
+                        # Extract Data
+                        evaluated = page.evaluate("""() => {
+                            const res = {
+                                is_retruth: false,
+                                retruth_header: "",
+                                full_text: "",
+                                media_urls: [],
+                                video_url: null,
+                                card_content: ""
+                            };
                             
-                            // Videos (status__video usually contains video or iframe)
-                            const videoEl = mediaDiv.querySelector('video');
-                            if (videoEl) {
-                                res.video_url = videoEl.src;
+                            // 1. Check ReTruth Header ("ReTruthed by...")
+                            const headerEl = document.querySelector('.status__header');
+                            if (headerEl && headerEl.innerText.includes('ReTruthed')) {
+                                res.is_retruth = true;
+                                res.retruth_header = headerEl.innerText.trim();
                             }
-                        }
+
+                            // 2. Get Full Text
+                            const contentEl = document.querySelector('.status__content');
+                            if (contentEl) {
+                                res.full_text = contentEl.innerText.trim();
+                            }
+
+                            // 3. Link Previews / Cards (CRITICAL for X posts and Articles)
+                            const cardEl = document.querySelector('a.status-card');
+                            if (cardEl) {
+                                const title = cardEl.querySelector('strong.status-card__title')?.innerText.trim();
+                                const desc = cardEl.querySelector('.status-card__description')?.innerText.trim();
+                                if (title || desc) {
+                                    res.card_content = [title, desc].filter(Boolean).join("\\n");
+                                }
+                            }
+
+                            // 4. Media Extraction (High Res)
+                            // Images
+                            const mediaDiv = document.querySelector('.status__media');
+                            if (mediaDiv) {
+                                const imgs = Array.from(mediaDiv.querySelectorAll('img'));
+                                res.media_urls = imgs.map(img => img.src);
+                                
+                                // Videos
+                                const videoEl = mediaDiv.querySelector('video');
+                                if (videoEl) {
+                                    res.video_url = videoEl.src;
+                                }
+                            }
+                            
+                            return res;
+                        }""")
                         
-                        return res;
-                    }""")
-                    
-                    details.update(evaluated)
-                    log(f"  -> Extracted: ReTruth={details['is_retruth']}, Card={bool(details.get('card_content'))}, Media={len(details['media_urls'])}")
+                        details.update(evaluated)
+                        log(f"  -> Extracted: ReTruth={details['is_retruth']}, Card={bool(details.get('card_content'))}, Media={len(details['media_urls'])}")
 
-                except Exception as e:
-                    log(f"⚠ [Stage 2] Could not find post content (possibly blocked or layout changed): {e}")
-
-                except Exception as e:
-                    log(f"✗ [Stage 2] Navigation error: {e}")
+                    except Exception as e:
+                        log(f"⚠ [Stage 2] Navigation/Timeout (skipping deep scrape): {e}")
                 
+                finally:
+                    try:
+                        browser.close()
+                    except Exception as e:
+                        log(f"⚠ [Stage 2] Warning: Could not close browser cleanly: {e}")
+
         except Exception as e:
-             log(f"✗ [Stage 2] Browser resource error: {e}")
+             log(f"✗ [Stage 2] Browser/Resource error: {e}")
 
         # Cancel alarm
         if hasattr(signal, "alarm"):
             signal.alarm(0)
-
-        # Ensure browser is closed
-        if 'browser' in locals():
-            try:
-                browser.close()
-            except Exception as e:
-                log(f"⚠ [Stage 2] Warning: Could not close browser cleanly: {e}")
 
         return details
 
@@ -369,30 +360,25 @@ class DiscordPoster:
             webhook = DiscordWebhook(url=self.webhook_url)
 
             embed = DiscordEmbed()
-            # ReTruth Context (Header)
-            retruth_header = post_data.get("retruth_header")
-            if retruth_header:
-                 embed.set_author(name=f"🔁 {retruth_header}", icon_url="https://truthsocial.com/favicon.ico")
+            embed.set_title("🇺🇸 Új Truth Social bejegyzés - Donald Trump")
 
-            # Description (Body)
             description_parts = []
             
-            # Truncate if too long
+            # Truncate if too long (Discord limit is ~4096 for description)
             if original_text and len(original_text) > 1800:
                 original_text = original_text[:1800] + "... [tovább az eredeti linken]"
             
-            # Formatting for ReTruths
-            # If we have a translation, the Narrative Prompt handles the introduction ("Trump shared...").
-            # We only add the explicit header if we are falling back to original English text.
+            # Formatting for ReTruths (Only if fallback)
             if post_data.get("is_retruth") and not translated_text:
+                 retruth_header = post_data.get("retruth_header", "ReTruth")
                  description_parts.append(f"**{retruth_header}**")
                  description_parts.append("---")
 
             if translated_text:
-                # If we have a translation, show ONLY the translation (User Request)
+                 # Standard output: Just the translation
                  description_parts.append(translated_text)
             elif original_text:
-                # Fallback
+                # Fallback output
                  description_parts.append(original_text)
 
             full_description = "\n".join(description_parts)
@@ -410,7 +396,7 @@ class DiscordPoster:
             if media_urls:
                 embed.set_image(url=media_urls[0])
 
-            # Add Video Link if available (Discord plays mp4/m3u8 often if linked directly, or just as a link)
+            # Add Video Link if available
             video_url = post_data.get("video_url")
             if video_url:
                  embed.add_embed_field(
@@ -419,9 +405,7 @@ class DiscordPoster:
                     inline=False
                 )
 
-            # Add extra space before the link
-
-            # Add extra space before the link
+            # Add Link
             post_url = post_data.get("url", "")
             if post_url:
                  embed.add_embed_field(
@@ -430,13 +414,9 @@ class DiscordPoster:
                     inline=False
                 )
 
-            # Spacer before footer
+            # Footer
             embed.add_embed_field(name="\u200b", value="\u200b", inline=False)
-
-            # Footer with original timestamp
             timestamp_str = post_data.get("timestamp_str", "")
-            
-            # Clean up timestamp: Extract date/time pattern "Month DD, YYYY @ HH:MM AM/PM ET"
             clean_time = timestamp_str
             if timestamp_str:
                 import re
@@ -445,10 +425,8 @@ class DiscordPoster:
                     clean_time = match.group(1)
             
             if clean_time:
-                # Discord footer supports newlines
                 embed.set_footer(text=f"🤖 Generated by TotM AI\nposted on Truth: {clean_time}")
             else:
-                # Fallback to current time
                 from datetime import datetime
                 import pytz
                 budapest_tz = pytz.timezone('Europe/Budapest')
@@ -462,257 +440,218 @@ class DiscordPoster:
             # Retry loop for Rate Limits (429)
             import time
             for attempt in range(3):
-                log(f"-> Sending Discord request (User: {self.webhook_url[:20]}...) [Attempt {attempt+1}] at {time.time()}")
+                log(f"-> Sending Discord request [Attempt {attempt+1}]")
                 response = webhook.execute()
 
                 if response.status_code == 429:
                     # Rate Limit Hit
                     try:
-                        # Try to get retry-after from headers, default to 5s
                         retry_after = float(response.headers.get('Retry-After', 5))
                     except:
                         retry_after = 5
                     
                     log(f"⚠ Discord Rate Limit (429). Waiting {retry_after}s before retry {attempt+1}/3...")
-                    time.sleep(retry_after + 1) # Add 1s buffer
-                    continue # Retry
+                    time.sleep(retry_after + 1)
+                    continue 
                 
                 elif response.status_code in [200, 204]:
                     log("✓ Posted to Discord successfully")
-                    break # Success
+                    break 
                 else:
                     log(f"✗ Discord post failed with status {response.status_code}")
-                    break # Don't retry other errors blindly
+                    break 
 
         except Exception as e:
             log(f"✗ Error posting to Discord: {e}")
 
 
 class StateManager:
-    """Manages persistent state for tracking processed posts"""
-
+    """Manages simple file-based state (last processed ID)"""
     def __init__(self, data_dir: str):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = self.data_dir / "last_id.txt"
-
+        self.state_file = Path(data_dir) / "last_id.txt"
+        
     def load_last_id(self) -> str:
-        """Load the last processed post ID"""
+        if not self.state_file.exists():
+            return None
         try:
-            if self.state_file.exists():
-                last_id = self.state_file.read_text().strip()
-                log(f"✓ Loaded last processed ID: {last_id}")
-                return last_id
-        except Exception as e:
-            log(f"⚠ Could not load state: {e}")
-        return None
+            return self.state_file.read_text().strip()    
+        except:
+            return None
 
     def save_last_id(self, last_id: str):
-        """Save the last processed post ID"""
         try:
             self.state_file.write_text(str(last_id))
-            # log(f"✓ Saved last processed ID: {last_id}") # Too verbose for every post
         except Exception as e:
-            log(f"⚠ Could not save state: {e}")
+            log(f"⚠ Warning: Could not save state: {e}")
 
 
 def validate_environment():
-    """Validate required environment variables"""
-    missing = []
-
-    if not DISCORD_WEBHOOK_URL:
-        missing.append("DISCORD_WEBHOOK_URL")
-    if not ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
-
+    """Ensure all required environment variables are set"""
+    required_vars = ["DISCORD_WEBHOOK_URL", "ANTHROPIC_API_KEY"]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    
     if missing:
-        log(f"✗ Missing required environment variables: {', '.join(missing)}")
-        return False
-
+        log(f"✗ Error: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+        
     log("✓ Environment variables validated")
-    return True
+    
+    if not os.path.exists(DATA_DIR):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            log(f"✓ Data directory created: {DATA_DIR}")
+        except Exception as e:
+            log(f"✗ Error creating data directory: {e}")
+
+    # Check write permissions
+    try:
+        test_file = Path(DATA_DIR) / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+        log("✓ Data directory is writable")
+    except Exception as e:
+        log(f"✗ Error: Data directory is not writable: {e}")
+        sys.exit(1)
+
+
+def to_int(val):
+    """Helper to convert ID string to int safely"""
+    try:
+        return int(val)
+    except:
+        return 0
 
 
 def main():
-    """Main execution loop"""
-    log("=" * 60)
+    log("------------------------------------------------------------")
+    validate_environment()
     log("Trump Scraper (Roll Call Aggregator Mode) - v2")
-    log("=" * 60)
+    log("============================================================")
 
-    if not validate_environment():
-        return
-
-    # Check if data directory exists and is writable
-    data_path = Path(DATA_DIR)
-    log(f"Data directory: {DATA_DIR}")
-    try:
-        data_path.mkdir(parents=True, exist_ok=True)
-        test_file = data_path / "test_write.tmp"
-        test_file.write_text("test")
-        test_file.unlink()
-        log(f"✓ Data directory is writable")
-    except Exception as e:
-        log(f"⚠ WARNING: Data directory not writable: {e}")
-        log(f"⚠ State persistence will NOT work - duplicates may occur!")
-
-    scraper = HybridScraper(headless=True)
-    translator = Translator(ANTHROPIC_API_KEY, ANTHROPIC_MODEL)
-    discord_poster = DiscordPoster(DISCORD_WEBHOOK_URL)
     state_manager = StateManager(DATA_DIR)
-
-    last_id = state_manager.load_last_id()
     
+    # Check Last ID
+    check_last_id = state_manager.load_last_id()
     if FORCE_REPROCESS:
-        log("⚠ FORCE_REPROCESS enabled: Ignoring saved state for this run!")
+        log("⚠ FORCE_REPROCESS is set to true. Ignoring saved state.")
         check_last_id = None
     else:
-        check_last_id = last_id
+        log(f"✓ Loaded last processed ID: {check_last_id}")
 
-    log(f"\n✓ Starting monitoring loop (interval: {CHECK_INTERVAL}s)")
-    log("-" * 60)
+    scraper = HybridScraper(headless=True)
+    translator = Translator(api_key=ANTHROPIC_API_KEY, model=ANTHROPIC_MODEL)
+    discord_poster = DiscordPoster(webhook_url=DISCORD_WEBHOOK_URL)
 
-    try:
-        while True:
-            log(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Checking Roll Call feed (Stage 1)...")
+    log(f"✓ Starting monitoring loop (interval: {CHECK_INTERVAL}s)")
 
-            posts = scraper.monitor_feed()
-
-            # Roll Call returns posts in DESC order (newest first)
-            # We want to process them in ASC order (oldest first)
-            posts.reverse()
-
-            # Find new posts (posts with ID > last_id)
-            new_posts = []
+    while True:
+        try:
+            log("\nChecking for new posts on Roll Call...")
             
-            # Helper to convert to int safely
-            def to_int(val):
-                try:
-                    return int(val)
-                except:
-                    return None
-
-            last_id_int = to_int(check_last_id) if check_last_id else None
-
-            if not check_last_id:
-                # First run / No state logic
-                if posts:
-                    if FORCE_REPROCESS:
-                        # If manually forced, process the last 5 posts for testing/debugging
-                        log("⚠ FORCE_REPROCESS: Processing the last 5 posts...")
-                        new_posts = posts[-5:] 
-                    else:
-                        # Normal First Run: Process ONLY the newest post to initialize state
+            # Scrape Feed (Roll Call)
+            posts = scraper.monitor_feed()
+            
+            if not posts:
+                log("⚠ Warning: No posts found on Roll Call (checking failed or empty)")
+            else:
+                new_posts = []
+                last_id_int = to_int(check_last_id) if check_last_id else 0
+                
+                if not check_last_id:
+                    # First run: ONLY newest post
+                    if posts:
                         newest_post = posts[-1]
                         new_posts = [newest_post]
-                        log(f"First run (no state): Processing only the latest post ({newest_post['id']}) to initialize.")
-            else:
-                # Normal operation: Filter posts newer than last_id
-                for post in posts:
-                    post_id_int = to_int(post['id'])
-                    
-                    if last_id_int and post_id_int:
-                        if post_id_int > last_id_int:
-                            new_posts.append(post)
-                    elif check_last_id:
-                         if str(post['id']) > str(check_last_id):
-                              new_posts.append(post)
+                        log(f"First run (or no state): Processing only the newest post ({newest_post['id']}) to initialize.")
+                else:
+                    # Normal: Filter newer
+                    for post in posts:
+                        post_id_int = to_int(post['id'])
+                        if last_id_int and post_id_int:
+                            if post_id_int > last_id_int:
+                                new_posts.append(post)
+                        elif check_last_id:
+                             if str(post['id']) > str(check_last_id):
+                                  new_posts.append(post)
 
-            if new_posts:
-                log(f"Found {len(new_posts)} new posts. Starting Stage 2 (Deep Scrape)...")
-                
-                for post in new_posts:
-                    log(f"Processing post {post['id']}...")
-                    
-                    # STAGE 2: Deep Scrape
-                    # We have the URL, now let's get the details
-                    details = scraper.scrape_details(post['url'])
-                    
-                    # Merge Logic (Smart Fallback):
-                    # 1. Capture what we want to keep from details
-                    deep_media = details.get('media_urls', [])
-                    video_url = details.get('video_url')
-                    full_text = details.get('full_text')
-                    is_retruth = details.get('is_retruth')
-                    retruth_header = details.get('retruth_header')
+                if new_posts:
+                    log(f"Found {len(new_posts)} new posts. Starting Stage 2 (Deep Scrape)...")
+                    for post in new_posts:
+                        log(f"Processing post {post['id']}...")
+                        
+                        # STAGE 2: Deep Scrape
+                        details = scraper.scrape_details(post['url'])
+                        
+                        # Merge Logic (Smart Fallback)
+                        deep_media = details.get('media_urls', [])
+                        video_url = details.get('video_url')
+                        full_text = details.get('full_text')
+                        is_retruth = details.get('is_retruth')
+                        retruth_header = details.get('retruth_header')
+                        
+                        post['is_retruth'] = is_retruth
+                        if is_retruth:
+                             post['retruth_header'] = retruth_header
+                        
+                        if video_url:
+                             post['video_url'] = video_url
+                        
+                        if full_text and len(full_text) > len(post.get('content', '')):
+                             post['content'] = full_text
 
-                    # 2. Update Post Text & Metadata
-                    post['is_retruth'] = is_retruth
-                    if is_retruth:
-                         post['retruth_header'] = retruth_header
-                    
-                    if video_url:
-                         post['video_url'] = video_url
-                    
-                    if full_text and len(full_text) > len(post.get('content', '')):
-                         post['content'] = full_text
+                        if deep_media:
+                            post['media_urls'] = deep_media
+                            log(f"  -> Using Deep Scrape media ({len(deep_media)} images)")
+                        else:
+                            log(f"  -> Deep Scrape found no media. Keeping Roll Call fallback ({len(post.get('media_urls', []))} images)")
 
-                    # 3. Image Priority
-                    # If Deep Scrape found images, use them (High Res).
-                    # If NOT, keep the Roll Call images (Stage 1), because they might be snapshots of X/Links.
-                    if deep_media:
-                        post['media_urls'] = deep_media
-                        log(f"  -> Using Deep Scrape media ({len(deep_media)} images)")
-                    else:
-                        log(f"  -> Deep Scrape found no media. Keeping Roll Call fallback ({len(post.get('media_urls', []))} images)")
+                        # Prepare text for translation
+                        original_text = translator.clean_text(post.get('content', ""))
+                        card_content = details.get('card_content', "")
+                        translated = ""
+                        
+                        # Composite Prompt Logic
+                        translation_parts = []
+                        
+                        if post.get('is_retruth'):
+                             header = post.get('retruth_header', 'ReTruthed from ???')
+                             translation_parts.append(f"[{header}]")
+                             if original_text:
+                                 translation_parts.append("[SHARED_CONTENT]")
+                                 translation_parts.append(original_text)
+                        else:
+                            if original_text:
+                                translation_parts.append(original_text)
 
-                    # NOTE: We do NOT call post.update(details) blindy anymore, to protect media_urls
+                        if card_content:
+                            translation_parts.append("\n[LINK_PREVIEW]")
+                            translation_parts.append(card_content)
 
-                    # Prepare text for translation
-                    original_text = translator.clean_text(post.get('content', ""))
-                    card_content = details.get('card_content', "")
-                    translated = ""
-                    
-                    # Construct Composite Prompt Logic
-                    translation_parts = []
-                    
-                    # 1. Trump's own text (or the ReTruth header context)
-                    if post.get('is_retruth'):
-                         header = post.get('retruth_header', 'ReTruthed from ???')
-                         translation_parts.append(f"[{header}]")
-                         
-                         # If it's a simple ReTruth (Trump wrote nothing), original_text is likely the shared content
-                         # We mark it as [SHARED_CONTENT] so the AI knows to say "Trump shared a post containing..."
-                         if original_text:
-                             translation_parts.append("[SHARED_CONTENT]")
-                             translation_parts.append(original_text)
-                    else:
-                        # Normal post by Trump
-                        if original_text:
-                            translation_parts.append(original_text)
+                        if translation_parts:
+                            full_input = "\n".join(translation_parts)
+                            translated = translator.translate_to_hungarian(full_input)
 
-                    # 2. Variable: Link Previews (X posts, Articles)
-                    # If we found card content (Title/Desc from X or Article), add it as context
-                    if card_content:
-                        translation_parts.append("\n[LINK_PREVIEW]")
-                        translation_parts.append(card_content)
+                        discord_poster.post_to_discord(post, translated, original_text)
+                        
+                        time.sleep(5) # Prevent Rate Limits
+                        
+                        # Update state immediately
+                        check_last_id = post['id']
+                        state_manager.save_last_id(check_last_id)
+                else:
+                    log("✓ No new posts found (since last check)")
 
-                    # 3. Execute Translation if we have ANY content
-                    if translation_parts:
-                        full_input = "\n".join(translation_parts)
-                        translated = translator.translate_to_hungarian(full_input)
-
-                    discord_poster.post_to_discord(post, translated, original_text)
-                    
-                    # Sleep to prevent Discord Rate Limits (429) and allow browser cleanup
-                    time.sleep(5)
-                    
-                    # Update state immediately
-                    check_last_id = post['id']
-                    state_manager.save_last_id(check_last_id)
-                    
-                    time.sleep(2)
-            else:
-                log("✓ No new posts found (since last check)")
-
-            log(f"\n⏳ Waiting {CHECK_INTERVAL} seconds until next check...")
+            log(f"⏳ Waiting {CHECK_INTERVAL} seconds until next check...")
             time.sleep(CHECK_INTERVAL)
 
-    except KeyboardInterrupt:
-        log("\n\n✓ Shutting down gracefully...")
-    except Exception as e:
-        log(f"\n✗ Unexpected error: {e}")
-        raise
-
+        except KeyboardInterrupt:
+            log("\n\n✓ Shutting down gracefully...")
+            sys.exit(0)
+        except Exception as e:
+            log(f"\n✗ Unexpected error: {e}")
+            # Fatal error? Loop continues?
+            # Better to sleep and retry
+            time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
     main()
