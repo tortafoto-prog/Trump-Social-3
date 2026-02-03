@@ -98,7 +98,7 @@ class HybridScraper:
                     time.sleep(5)
                     
                     # Run extraction code in browser
-                    extracted_data = page.evaluate("""() => {
+                    extracted_data = page.evaluate(r"""() => {
                         const posts = [];
                         const cards = document.querySelectorAll('div.rounded-xl.border');
 
@@ -143,8 +143,14 @@ class HybridScraper:
                             }
                         });
                         
-                        // Sort by ID (numerical) just in case
-                        posts.sort((a, b) => BigInt(a.id) - BigInt(b.id));
+                        // Sort by ID (numerical) safely with BigInt
+                        posts.sort((a, b) => {
+                             const bigA = BigInt(a.id);
+                             const bigB = BigInt(b.id);
+                             if (bigA < bigB) return -1;
+                             if (bigA > bigB) return 1;
+                             return 0;
+                        });
                         return posts;
                     }""")
 
