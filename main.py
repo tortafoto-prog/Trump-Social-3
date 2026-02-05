@@ -657,8 +657,8 @@ def main():
             if 'cycle_count' not in locals(): cycle_count = 0
             cycle_count += 1
             if cycle_count >= 30:
-                log("🔄 Periodic Maintenance: Exiting to force container restart (clearing resources)...")
-                sys.exit(0)
+                log("🔄 Periodic Maintenance: Exiting with code 1 to FORCE container restart (clearing resources)...")
+                sys.exit(1)
 
         except KeyboardInterrupt:
             log("\n\n✓ Shutting down gracefully...")
