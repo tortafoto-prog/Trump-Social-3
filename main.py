@@ -654,11 +654,12 @@ def main():
             # To prevent zombie processes or memory leaks accumulating over 24h+,
             # we voluntarily exit after a set number of cycles (e.g., 30 cycles * 2 min = 1 hour).
             # Railway/Docker will automatically restart the container, ensuring a fresh environment.
+            # Railway/Docker will automatically restart the container, ensuring a fresh environment.
             if 'cycle_count' not in locals(): cycle_count = 0
             cycle_count += 1
             if cycle_count >= 30:
-                log("🔄 Periodic Maintenance: Exiting with code 1 to FORCE container restart (clearing resources)...")
-                sys.exit(1)
+                log("🔄 Periodic Maintenance: Exiting (cleanly) to reload process via start.sh...")
+                sys.exit(0)
 
         except KeyboardInterrupt:
             log("\n\n✓ Shutting down gracefully...")
